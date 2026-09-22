@@ -1,7 +1,7 @@
-//! Proof-of-Work для защиты регистрации
-//! Биты: Weak = 16 (~65k попыток)
-//!       Medium = 20 (~1M попыток)
-//!       Strong = 24 (~16M попыток)
+//! Proof of work that guards registration
+//! Bits, Weak = 16, about 65k attempts
+//!       Medium = 20, about 1M attempts
+//!       Strong = 24, about 16M attempts
 
 use rand::RngExt;
 use sha2::{Digest, Sha256};

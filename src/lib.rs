@@ -1,22 +1,20 @@
 //! Wire protocol shared by the Zeevum server and its clients.
 //!
-//! Transport is line-delimited JSON over TLS: one frame per message, terminated
+//! Transport is line-delimited JSON over TLS, one frame per message, terminated
 //! by `\n`. See [`encode`] and [`decode`].
 //!
-//! # Identity model
-//!
 //! Two distinct identifiers, and mixing them up is the mistake this module
-//! exists to prevent:
+//! exists to prevent.
 //!
-//! * [`UserId`] — *who* somebody is. Public, stable, safe to show and to look
+//! - [`UserId`], who somebody is. Public, stable, safe to show and to look
 //!   up by login.
-//! * [`ConvId`] — *where* a message goes. A conversation: a 1:1 chat today, a
-//!   group in the future. Opaque to clients: obtain one from the server
-//!   ([`ServerMsg::DmResolved`], [`ServerMsg::FriendList`], group creation) and
+//! - [`ConvId`], where a message goes. A conversation, a 1:1 chat today, a
+//!   group in the future. Opaque to clients, obtain one from the server,
+//!   [`ServerMsg::DmResolved`], [`ServerMsg::FriendList`], group creation, and
 //!   store it. Never derive or guess one.
 //!
 //! Addressing messages by `ConvId` rather than by peer is what keeps group
-//! chats and end-to-end encryption additive instead of breaking: both need
+//! chats and end-to-end encryption additive instead of breaking, both need
 //! "the conversation" to be a first-class object that is not the same thing as
 //! "the other participant".
 
@@ -25,32 +23,27 @@ use uuid::Uuid;
 
 pub mod pow;
 
-/// Bumped on every breaking change to the message types: renaming a field,
+/// Bumped on every breaking change to the message types. Renaming a field,
 /// changing a type, removing a variant. Adding a variant breaks older receivers
 /// too, so it counts as breaking as well.
 pub const PROTOCOL_VERSION: u32 = 2;
 pub const MAX_LOGIN_LEN: usize = 32;
 pub const MAX_MESSAGE_LEN: usize = 4096;
-/// Denial-of-service guard: a frame longer than this closes the connection.
+/// A frame longer than this closes the connection.
 pub const MAX_LINE_BYTES: usize = 64 * 1024;
-/// How many history messages a single [`ClientMsg::HistoryReq`] returns.
 pub const HISTORY_LIMIT: i64 = 50;
 
-/// Public, stable identifier of a user account.
 pub type UserId = i64;
 
-/// Identifier of a conversation. Opaque to clients.
+/// Opaque to clients.
 pub type ConvId = Uuid;
 
-/// Short description of a user, carried in friend lists and requests.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct UserBrief {
     pub user_id: UserId,
     pub login: String,
 }
 
-/// Machine-readable reason a request was rejected.
-///
 /// Clients branch on the variant, never on text. Text in
 /// [`ServerMsg::Error::detail`] is for logs and debugging only.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -60,10 +53,12 @@ pub enum ErrorCode {
     // Handshake
     //
     /// The client speaks a protocol version this server does not support.
-    UnsupportedProtocolVersion { server_version: u32 },
+    UnsupportedProtocolVersion {
+        server_version: u32,
+    },
     /// Wrong login or password, or an invalid/expired token.
     InvalidCredentials,
-    /// Registration rejected: login taken, malformed, or password too weak.
+    /// Login taken, malformed, or password too weak.
     RegistrationFailed,
     /// The frame could not be parsed, or arrived when it was not allowed.
     MalformedFrame,
@@ -73,26 +68,17 @@ pub enum ErrorCode {
     //
     /// The user is not a participant of the conversation they addressed.
     NotAMember,
-    /// A direct conversation cannot be opened because the two users are not
-    /// friends.
+    /// Distinct from [`ErrorCode::NotAMember`], that one is about a conversation
+    /// that exists, this one is about a relationship that does not. A client that
+    /// receives this on `ResolveDm` should offer to add the peer.
     ///
-    /// Distinct from [`ErrorCode::NotAMember`]: that one is about a
-    /// conversation that exists, this one is about a relationship that does
-    /// not. A client that receives this on `ResolveDm` should offer to add the
-    /// peer, not drop a conversation from its list.
-    ///
-    /// Deliberately does not separate "never were friends" from "blocked": the
+    /// Deliberately does not separate "never were friends" from "blocked", the
     /// caller must not be able to tell the difference.
     NotFriends,
-    /// `AcceptFriend` without a pending request from that user.
     NoPendingRequest,
-    /// The users are already friends.
     AlreadyFriends,
-    /// A user tried to befriend or message themselves.
     CannotTargetYourself,
-    /// No such conversation.
     ConversationNotFound,
-    /// No user with that login or id.
     UserNotFound,
 
     //
@@ -104,7 +90,6 @@ pub enum ErrorCode {
     //
     // Server
     //
-    /// Anything the server could not handle. Database failure and friends.
     Internal,
 }
 
@@ -142,32 +127,44 @@ pub enum ClientMsg {
         protocol_version: u32,
         method: AuthMethod,
     },
-    /// Answer to [`ServerMsg::PowChallenge`] during registration
-    PowSolution { nonce: u64 },
-    /// Look a user up by login
-    SearchUser { login: String },
-    /// Send a friend request
-    FriendReq { target_user_id: UserId },
-    /// Accept an incoming friend request
-    AcceptFriend { target_user_id: UserId },
-    /// Get (or lazily create) the 1:1 conversation with a user
-    ResolveDm { peer_user_id: UserId },
-    /// Ask for the recent history of a conversation
-    HistoryReq { conv_id: ConvId },
-    /// Send a message. `message_id` is generated by the client so that it can
-    /// match the acknowledgement to the message it optimistically rendered
+    PowSolution {
+        nonce: u64,
+    },
+    SearchUser {
+        login: String,
+    },
+    FriendReq {
+        target_user_id: UserId,
+    },
+    AcceptFriend {
+        target_user_id: UserId,
+    },
+    /// Created on first use
+    ResolveDm {
+        peer_user_id: UserId,
+    },
+    HistoryReq {
+        conv_id: ConvId,
+    },
+    /// `message_id` is generated by the client so that it can match the
+    /// acknowledgement to the message it optimistically rendered
     SendMsg {
         message_id: Uuid,
         conv_id: ConvId,
         content: String,
     },
-    /// Mark a message as read; notifies the sender
-    MarkRead { message_id: Uuid },
-    /// Drop the session this connection was authenticated with
-    Logout { all_sessions: bool },
+    /// Notifies the sender
+    MarkRead {
+        message_id: Uuid,
+    },
+    /// `all_sessions` also drops every other session of the user. The server
+    /// closes the connection either way
+    Logout {
+        all_sessions: bool,
+    },
 }
 
-/// How to authenticate. Registration additionally requires proof of work.
+/// Registration additionally requires proof of work.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AuthMethod {
@@ -176,7 +173,6 @@ pub enum AuthMethod {
     Register { login: String, password: String },
 }
 
-/// Message from server to client.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMsg {
@@ -185,35 +181,45 @@ pub enum ServerMsg {
         challenge: String,
         difficulty_bits: u32,
     },
-    /// Successful authentication.
     AuthOk {
         user_id: UserId,
         token: String,
         expires_at: i64,
     },
-    /// A request was rejected. Also used for handshake failures.
+    /// Also used for handshake failures.
     Error {
         code: ErrorCode,
         /// Free-form detail for logs and debugging. Never shown to users as-is.
         detail: Option<String>,
     },
-    /// Starting state: accepted friends.
-    FriendList { entries: Vec<UserBrief> },
-    /// Starting state: incoming friend requests.
-    PendingReqs { entries: Vec<UserBrief> },
-    /// Someone sent you a friend request while you are online.
-    IncomingReq { from: UserBrief },
-    /// A friend request was accepted; sent to both sides.
-    FriendAdded { user: UserBrief },
-    /// Your [`ClientMsg::FriendReq`] was stored.
-    FriendReqSent { user: UserBrief },
-    /// Result of [`ClientMsg::SearchUser`].
-    UserFound { user: UserBrief },
-    /// Result of [`ClientMsg::SearchUser`].
+    /// Starting state, accepted friends.
+    FriendList {
+        entries: Vec<UserBrief>,
+    },
+    /// Starting state, incoming friend requests.
+    PendingReqs {
+        entries: Vec<UserBrief>,
+    },
+    /// While you are online, a push rather than part of the starting state.
+    IncomingReq {
+        from: UserBrief,
+    },
+    /// Sent to both sides.
+    FriendAdded {
+        user: UserBrief,
+    },
+    FriendReqSent {
+        user: UserBrief,
+    },
+    UserFound {
+        user: UserBrief,
+    },
     UserNotFound,
-    /// Result of [`ClientMsg::ResolveDm`]: the conversation to address.
-    DmResolved { conv_id: ConvId, peer: UserBrief },
-    /// One history message; the batch ends with [`ServerMsg::HistoryEnd`].
+    DmResolved {
+        conv_id: ConvId,
+        peer: UserBrief,
+    },
+    /// The batch ends with [`ServerMsg::HistoryEnd`].
     HistoryMsg {
         message_id: Uuid,
         conv_id: ConvId,
@@ -222,11 +228,13 @@ pub enum ServerMsg {
         content: String,
         is_read: bool,
     },
-    /// End of a history batch.
-    HistoryEnd { conv_id: ConvId },
-    /// The message was persisted by the server.
-    MsgAck { message_id: Uuid, conv_id: ConvId },
-    /// An incoming message.
+    HistoryEnd {
+        conv_id: ConvId,
+    },
+    MsgAck {
+        message_id: Uuid,
+        conv_id: ConvId,
+    },
     RecvMsg {
         message_id: Uuid,
         conv_id: ConvId,
@@ -234,18 +242,18 @@ pub enum ServerMsg {
         timestamp: i64,
         content: String,
     },
-    /// The recipient read your message.
-    MsgRead { message_id: Uuid, conv_id: ConvId },
+    MsgRead {
+        message_id: Uuid,
+        conv_id: ConvId,
+    },
 }
 
-/// Serializes a message into a wire frame: JSON plus a trailing newline.
 pub fn encode<T: Serialize>(msg: &T) -> serde_json::Result<String> {
     let mut line = serde_json::to_string(msg)?;
     line.push('\n');
     Ok(line)
 }
 
-/// Parses a wire frame.
 pub fn decode<T: serde::de::DeserializeOwned>(line: &str) -> serde_json::Result<T> {
     serde_json::from_str(line.trim())
 }
@@ -322,7 +330,7 @@ mod tests {
         assert_eq!(back, msg);
     }
 
-    /// The wire format is a public contract: renaming a JSON field silently
+    /// The wire format is a public contract, renaming a JSON field silently
     /// breaks clients that were built against an older version.
     #[test]
     fn wire_tags_are_stable() {
@@ -333,7 +341,7 @@ mod tests {
                 login: "bob".into(),
             },
         })
-        .unwrap();
+            .unwrap();
         assert!(line.contains(r#""type":"dm_resolved""#), "{line}");
         assert!(line.contains(r#""conv_id""#), "{line}");
         assert!(line.contains(r#""user_id":42"#), "{line}");
@@ -359,8 +367,8 @@ mod tests {
             code: ErrorCode::NotAMember,
             detail: None,
         })
-        .unwrap();
-        // Nested tag: the frame tag is "type", the error tag is "code".
+            .unwrap();
+        // Nested tag, the frame tag is "type", the error tag is "code".
         assert!(line.contains(r#""type":"error""#), "{line}");
         assert!(line.contains(r#""code":"not_a_member""#), "{line}");
     }
@@ -386,7 +394,7 @@ mod tests {
         }
     }
 
-    /// A client must be able to tell the codes apart without parsing text:
+    /// A client must be able to tell the codes apart without parsing text,
     /// this is the whole point of replacing `reason: String`.
     #[test]
     fn error_codes_are_distinguishable() {
