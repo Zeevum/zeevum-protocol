@@ -391,7 +391,7 @@ mod tests {
                 login: "bob".into(),
             },
         })
-            .unwrap();
+        .unwrap();
         assert!(line.contains(r#""type":"dm_resolved""#), "{line}");
         assert!(line.contains(r#""conv_id""#), "{line}");
         assert!(line.contains(r#""user_id":42"#), "{line}");
@@ -417,7 +417,7 @@ mod tests {
             code: ErrorCode::NotAMember,
             detail: None,
         })
-            .unwrap();
+        .unwrap();
         // Nested tag, the frame tag is "type", the error tag is "code".
         assert!(line.contains(r#""type":"error""#), "{line}");
         assert!(line.contains(r#""code":"not_a_member""#), "{line}");
