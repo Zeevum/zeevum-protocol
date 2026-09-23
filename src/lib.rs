@@ -44,6 +44,15 @@ pub struct UserBrief {
     pub login: String,
 }
 
+/// How much of one conversation the reader has not seen. `count` is messages
+/// written by somebody else and not yet read, never the reader's own.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct UnreadEntry {
+    pub conv_id: ConvId,
+    pub peer: UserBrief,
+    pub count: u32,
+}
+
 /// Clients branch on the variant, never on text. Text in
 /// [`ServerMsg::Error::detail`] is for logs and debugging only.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -200,6 +209,11 @@ pub enum ServerMsg {
     PendingReqs {
         entries: Vec<UserBrief>,
     },
+    /// Starting state, unread counts. Conversations with nothing unread are
+    /// left out, so an empty list is the common case, not an error.
+    UnreadSummary {
+        entries: Vec<UnreadEntry>,
+    },
     /// While you are online, a push rather than part of the starting state.
     IncomingReq {
         from: UserBrief,
@@ -261,6 +275,42 @@ pub fn decode<T: serde::de::DeserializeOwned>(line: &str) -> serde_json::Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn roundtrip_unread_summary() {
+        let msg = ServerMsg::UnreadSummary {
+            entries: vec![
+                UnreadEntry {
+                    conv_id: Uuid::new_v4(),
+                    peer: UserBrief {
+                        user_id: 7,
+                        login: "alice".into(),
+                    },
+                    count: 3,
+                },
+                UnreadEntry {
+                    conv_id: Uuid::new_v4(),
+                    peer: UserBrief {
+                        user_id: 9,
+                        login: "bob".into(),
+                    },
+                    count: 1,
+                },
+            ],
+        };
+        let line = encode(&msg).unwrap();
+        let back: ServerMsg = decode(&line).unwrap();
+        assert_eq!(back, msg);
+    }
+
+    /// The common case at login: nothing unread anywhere.
+    #[test]
+    fn an_empty_unread_summary_is_still_a_frame() {
+        let msg = ServerMsg::UnreadSummary { entries: vec![] };
+        let line = encode(&msg).unwrap();
+        let back: ServerMsg = decode(&line).unwrap();
+        assert_eq!(back, msg);
+    }
 
     #[test]
     fn roundtrip_auth_login() {
@@ -341,7 +391,7 @@ mod tests {
                 login: "bob".into(),
             },
         })
-        .unwrap();
+            .unwrap();
         assert!(line.contains(r#""type":"dm_resolved""#), "{line}");
         assert!(line.contains(r#""conv_id""#), "{line}");
         assert!(line.contains(r#""user_id":42"#), "{line}");
@@ -367,7 +417,7 @@ mod tests {
             code: ErrorCode::NotAMember,
             detail: None,
         })
-        .unwrap();
+            .unwrap();
         // Nested tag, the frame tag is "type", the error tag is "code".
         assert!(line.contains(r#""type":"error""#), "{line}");
         assert!(line.contains(r#""code":"not_a_member""#), "{line}");
