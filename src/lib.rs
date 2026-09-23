@@ -26,7 +26,7 @@ pub mod pow;
 /// Bumped on every breaking change to the message types. Renaming a field,
 /// changing a type, removing a variant. Adding a variant breaks older receivers
 /// too, so it counts as breaking as well.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 pub const MAX_LOGIN_LEN: usize = 32;
 pub const MAX_MESSAGE_LEN: usize = 4096;
 /// A frame longer than this closes the connection.
