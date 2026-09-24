@@ -26,7 +26,7 @@ pub mod pow;
 /// Bumped on every breaking change to the message types. Renaming a field,
 /// changing a type, removing a variant. Adding a variant breaks older receivers
 /// too, so it counts as breaking as well.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 pub const MAX_LOGIN_LEN: usize = 32;
 pub const MAX_MESSAGE_LEN: usize = 4096;
 /// A frame longer than this closes the connection.
@@ -69,6 +69,9 @@ pub enum ErrorCode {
     InvalidCredentials,
     /// Login taken, malformed, or password too weak.
     RegistrationFailed,
+    /// The password was reset by an admin and has to be replaced before
+    /// anything else is allowed.
+    MustChangePassword,
     /// The frame could not be parsed, or arrived when it was not allowed.
     MalformedFrame,
 
@@ -113,6 +116,10 @@ impl std::fmt::Display for ErrorCode {
             Self::RegistrationFailed => write!(
                 f,
                 "Registration failed. Check login format and password strength."
+            ),
+            Self::MustChangePassword => write!(
+                f,
+                "Your password was reset by an administrator and has to be changed before you can continue."
             ),
             Self::MalformedFrame => write!(f, "Malformed frame"),
             Self::NotAMember => write!(f, "You are not a member of this conversation"),
@@ -171,6 +178,15 @@ pub enum ClientMsg {
     Logout {
         all_sessions: bool,
     },
+    /// Replaces the password and clears the flag that locked the account.
+    /// The old one is asked for even though the session is already proven,
+    /// so that a token alone is not enough to take an account over.
+    ///
+    /// The only frame accepted while `must_change_password` is set.
+    ChangePassword {
+        old_password: String,
+        new_password: String,
+    },
 }
 
 /// Registration additionally requires proof of work.
@@ -190,10 +206,15 @@ pub enum ServerMsg {
         challenge: String,
         difficulty_bits: u32,
     },
+    /// `must_change_password` locks everything except
+    /// [`ClientMsg::ChangePassword`]. Sent again, cleared, once the password
+    /// has been replaced, so that a client needs only one path out of the
+    /// lock.
     AuthOk {
         user_id: UserId,
         token: String,
         expires_at: i64,
+        must_change_password: bool,
     },
     /// Also used for handshake failures.
     Error {
