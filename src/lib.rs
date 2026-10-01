@@ -193,9 +193,22 @@ pub enum ClientMsg {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AuthMethod {
-    Token { token: String },
-    Login { login: String, password: String },
-    Register { login: String, password: String },
+    Token {
+        token: String,
+    },
+    Login {
+        login: String,
+        password: String,
+    },
+    Register {
+        login: String,
+        password: String,
+        /// Required when the server only registers by invitation. Optional
+        /// on the wire: a frame without it is one from before invitations
+        /// existed, and parses the same.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        invite_code: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -333,6 +346,54 @@ mod tests {
         assert_eq!(back, msg);
     }
 
+    /// A register frame from before invitations existed has no
+    /// `invite_code` and must still parse.
+    #[test]
+    fn register_without_an_invite_code_parses() {
+        let old_frame = r#"{"type":"auth","protocol_version":4,"method":{"kind":"register","login":"a","password":"b"}}"#;
+        let msg: ClientMsg = decode(old_frame).unwrap();
+        let ClientMsg::Auth {
+            method: AuthMethod::Register { invite_code, .. },
+            ..
+        } = msg
+        else {
+            panic!("not a register frame");
+        };
+        assert_eq!(invite_code, None);
+    }
+
+    #[test]
+    fn register_with_an_invite_code_roundtrips() {
+        let msg = ClientMsg::Auth {
+            protocol_version: PROTOCOL_VERSION,
+            method: AuthMethod::Register {
+                login: "alice".into(),
+                password: "p@ss w0rd!".into(),
+                invite_code: Some("ABCD2345".into()),
+            },
+        };
+        let line = encode(&msg).unwrap();
+        assert!(line.contains("invite_code"));
+        let back: ClientMsg = decode(&line).unwrap();
+        assert_eq!(back, msg);
+    }
+
+    /// Without a code the field is absent rather than null, so the frame is
+    /// byte-identical to what a client before invitations used to send.
+    #[test]
+    fn register_without_a_code_serializes_like_it_used_to() {
+        let msg = ClientMsg::Auth {
+            protocol_version: PROTOCOL_VERSION,
+            method: AuthMethod::Register {
+                login: "alice".into(),
+                password: "p@ss w0rd!".into(),
+                invite_code: None,
+            },
+        };
+        let line = encode(&msg).unwrap();
+        assert!(!line.contains("invite_code"));
+    }
+
     #[test]
     fn roundtrip_auth_login() {
         let msg = ClientMsg::Auth {
@@ -450,6 +511,7 @@ mod tests {
             ErrorCode::UnsupportedProtocolVersion { server_version: 2 },
             ErrorCode::InvalidCredentials,
             ErrorCode::RegistrationFailed,
+            ErrorCode::MustChangePassword,
             ErrorCode::MalformedFrame,
             ErrorCode::NotAMember,
             ErrorCode::NoPendingRequest,
