@@ -27,9 +27,11 @@ pub mod pow;
 /// Bumped on every breaking change to the message types. Renaming a field,
 /// changing a type, removing a variant. Adding a variant breaks older receivers
 /// too, so it counts as breaking as well.
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 pub const MAX_LOGIN_LEN: usize = 32;
 pub const MAX_MESSAGE_LEN: usize = 4096;
+/// The longest a group title may be, checked on creation and on rename.
+pub const MAX_TITLE_LEN: usize = 64;
 /// A frame longer than this closes the connection.
 pub const MAX_LINE_BYTES: usize = 64 * 1024;
 pub const HISTORY_LIMIT: i64 = 50;
@@ -45,13 +47,69 @@ pub struct UserBrief {
     pub login: String,
 }
 
-/// How much of one conversation the reader has not seen. `count` is messages
-/// written by somebody else and not yet read, never the reader's own.
+/// What an administrator of a group may do. The owner's set is always full,
+/// so an owner is never described by this type.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AdminRights {
+    pub change_info: bool,
+    pub invite_users: bool,
+    pub ban_users: bool,
+    pub add_admins: bool,
+}
+
+/// A member's standing in a group. The owner is who the group belongs to;
+/// their rights are always the full set.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemberRole {
+    Owner,
+    Admin,
+    Member,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct UnreadEntry {
+pub struct GroupMember {
+    pub user: UserBrief,
+    pub role: MemberRole,
+    /// Meaningful for an admin; sent full for the owner, so a reader never
+    /// has to special-case the field.
+    pub rights: AdminRights,
+}
+
+/// The one line a conversation list entry shows under its title.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LastMessage {
+    pub message_id: Uuid,
+    pub sender_user_id: UserId,
+    pub timestamp: i64,
+    /// Truncated by the server, so the list never drags whole messages.
+    pub preview: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatKind {
+    Private {
+        peer: UserBrief,
+    },
+    /// `you_left` is the owner who left but kept the ownership: the
+    /// conversation stays in their list so they can come back or delete the
+    /// group. False for everybody else.
+    Group {
+        title: String,
+        you_left: bool,
+    },
+}
+
+/// One row of the conversation list, the starting state after
+/// [`ServerMsg::AuthOk`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ChatEntry {
     pub conv_id: ConvId,
-    pub peer: UserBrief,
-    pub count: u32,
+    pub kind: ChatKind,
+    /// Messages by others past the reader's read cursor.
+    pub unread: u32,
+    pub last: Option<LastMessage>,
 }
 
 /// Clients branch on the variant, never on text. Text in
@@ -95,6 +153,15 @@ pub enum ErrorCode {
     UserNotFound,
 
     //
+    // Groups
+    //
+    /// The right the action needs is missing, or is reserved for the owner.
+    NotPermitted,
+    AlreadyMember,
+    /// The group title exceeds [`MAX_TITLE_LEN`].
+    TitleTooLong,
+
+    //
     // Messages
     //
     /// Content exceeds [`MAX_MESSAGE_LEN`].
@@ -130,6 +197,9 @@ impl std::fmt::Display for ErrorCode {
             Self::CannotTargetYourself => write!(f, "Cannot target yourself"),
             Self::ConversationNotFound => write!(f, "Conversation not found"),
             Self::UserNotFound => write!(f, "User not found"),
+            Self::NotPermitted => write!(f, "Not enough rights"),
+            Self::AlreadyMember => write!(f, "Already a member"),
+            Self::TitleTooLong => write!(f, "Group title is too long"),
             Self::MessageTooLong => write!(f, "Message too long"),
             Self::Internal => write!(f, "Internal server error"),
         }
@@ -173,6 +243,54 @@ pub enum ClientMsg {
     /// Notifies the sender
     MarkRead {
         message_id: Uuid,
+    },
+    /// The creator becomes the owner, everyone listed joins as a member.
+    /// Every one of them must be a friend of the creator's; an empty list is
+    /// fine, members can be added later.
+    CreateGroup {
+        title: String,
+        members: Vec<UserId>,
+    },
+    /// Requires the `invite_users` right; the invitee must be a friend of
+    /// the inviter's and not a member yet.
+    GroupAddMember {
+        conv_id: ConvId,
+        target_user_id: UserId,
+    },
+    /// Requires the `ban_users` right. An administrator can only be removed
+    /// by the owner; the owner by nobody.
+    GroupRemoveMember {
+        conv_id: ConvId,
+        target_user_id: UserId,
+    },
+    /// Requires the `add_admins` right, and the rights granted may not
+    /// exceed the granter's. Zero rights demotes back to a member.
+    GroupSetAdmin {
+        conv_id: ConvId,
+        target_user_id: UserId,
+        rights: AdminRights,
+    },
+    /// Requires the `change_info` right.
+    RenameGroup {
+        conv_id: ConvId,
+        title: String,
+    },
+    /// The owner's flag decides what happens to the ownership: handed to the
+    /// first administrator, or kept, so the owner can [`ClientMsg::JoinGroup`]
+    /// later. Ignored for everyone else, who just leaves.
+    LeaveGroup {
+        conv_id: ConvId,
+        #[serde(default)]
+        transfer_ownership: bool,
+    },
+    /// The owner coming back to a group they left without transferring.
+    JoinGroup {
+        conv_id: ConvId,
+    },
+    /// Owner only, whether they are a participant or left with the ownership
+    /// kept.
+    DeleteGroup {
+        conv_id: ConvId,
     },
     /// `all_sessions` also drops every other session of the user. The server
     /// closes the connection either way
@@ -244,10 +362,11 @@ pub enum ServerMsg {
     PendingReqs {
         entries: Vec<UserBrief>,
     },
-    /// Starting state, unread counts. Conversations with nothing unread are
-    /// left out, so an empty list is the common case, not an error.
-    UnreadSummary {
-        entries: Vec<UnreadEntry>,
+    /// Starting state: every conversation of the user's, private and group
+    /// alike, with what the list shows — the unread count and the last
+    /// message.
+    ChatList {
+        entries: Vec<ChatEntry>,
     },
     /// While you are online, a push rather than part of the starting state.
     IncomingReq {
@@ -267,6 +386,19 @@ pub enum ServerMsg {
     DmResolved {
         conv_id: ConvId,
         peer: UserBrief,
+    },
+    /// The whole truth about a group: title, membership, roles, rights. Sent
+    /// to every participant on creation and on every change; whoever was
+    /// removed gets [`ServerMsg::RemovedFromGroup`] instead.
+    GroupInfo {
+        conv_id: ConvId,
+        title: String,
+        members: Vec<GroupMember>,
+    },
+    /// The conversation is gone for the recipient: removed from the group,
+    /// left it, or the group was deleted.
+    RemovedFromGroup {
+        conv_id: ConvId,
     },
     /// The batch ends with [`ServerMsg::HistoryEnd`].
     HistoryMsg {
@@ -410,24 +542,42 @@ mod tests {
     }
 
     #[test]
-    fn roundtrip_unread_summary() {
-        let msg = ServerMsg::UnreadSummary {
+    fn roundtrip_chat_list() {
+        let msg = ServerMsg::ChatList {
             entries: vec![
-                UnreadEntry {
+                ChatEntry {
                     conv_id: Uuid::new_v4(),
-                    peer: UserBrief {
-                        user_id: 7,
-                        login: "alice".into(),
+                    kind: ChatKind::Private {
+                        peer: UserBrief {
+                            user_id: 7,
+                            login: "alice".into(),
+                        },
                     },
-                    count: 3,
+                    unread: 3,
+                    last: Some(LastMessage {
+                        message_id: Uuid::new_v4(),
+                        sender_user_id: 7,
+                        timestamp: 1730000000,
+                        preview: "привет".into(),
+                    }),
                 },
-                UnreadEntry {
+                ChatEntry {
                     conv_id: Uuid::new_v4(),
-                    peer: UserBrief {
-                        user_id: 9,
-                        login: "bob".into(),
+                    kind: ChatKind::Group {
+                        title: "Дача".into(),
+                        you_left: false,
                     },
-                    count: 1,
+                    unread: 0,
+                    last: None,
+                },
+                ChatEntry {
+                    conv_id: Uuid::new_v4(),
+                    kind: ChatKind::Group {
+                        title: "Покинутая".into(),
+                        you_left: true,
+                    },
+                    unread: 0,
+                    last: None,
                 },
             ],
         };
@@ -436,13 +586,124 @@ mod tests {
         assert_eq!(back, msg);
     }
 
-    /// The common case at login: nothing unread anywhere.
+    /// The common case at login: no conversations at all.
     #[test]
-    fn an_empty_unread_summary_is_still_a_frame() {
-        let msg = ServerMsg::UnreadSummary { entries: vec![] };
+    fn an_empty_chat_list_is_still_a_frame() {
+        let msg = ServerMsg::ChatList { entries: vec![] };
         let line = encode(&msg).unwrap();
         let back: ServerMsg = decode(&line).unwrap();
         assert_eq!(back, msg);
+    }
+
+    /// One of each role, so a missing role or a broken rights shape fails
+    /// here rather than in a client.
+    #[test]
+    fn roundtrip_group_info() {
+        let msg = ServerMsg::GroupInfo {
+            conv_id: Uuid::new_v4(),
+            title: "Дача".into(),
+            members: vec![
+                GroupMember {
+                    user: UserBrief {
+                        user_id: 1,
+                        login: "owner".into(),
+                    },
+                    role: MemberRole::Owner,
+                    rights: AdminRights {
+                        change_info: true,
+                        invite_users: true,
+                        ban_users: true,
+                        add_admins: true,
+                    },
+                },
+                GroupMember {
+                    user: UserBrief {
+                        user_id: 2,
+                        login: "admin".into(),
+                    },
+                    role: MemberRole::Admin,
+                    rights: AdminRights {
+                        invite_users: true,
+                        ..AdminRights::default()
+                    },
+                },
+                GroupMember {
+                    user: UserBrief {
+                        user_id: 3,
+                        login: "member".into(),
+                    },
+                    role: MemberRole::Member,
+                    rights: AdminRights::default(),
+                },
+            ],
+        };
+        let line = encode(&msg).unwrap();
+        let back: ServerMsg = decode(&line).unwrap();
+        assert_eq!(back, msg);
+    }
+
+    #[test]
+    fn roundtrip_create_group() {
+        let msg = ClientMsg::CreateGroup {
+            title: "Дача".into(),
+            members: vec![7, 9, 11],
+        };
+        let back: ClientMsg = decode(&encode(&msg).unwrap()).unwrap();
+        assert_eq!(back, msg);
+    }
+
+    /// A member leaving says nothing about ownership: the field is the
+    /// owner's only, and defaults to false.
+    #[test]
+    fn leave_group_without_a_transfer_field_parses() {
+        let frame = format!(r#"{{"type":"leave_group","conv_id":"{}"}}"#, Uuid::new_v4());
+        let msg: ClientMsg = decode(&frame).unwrap();
+        let ClientMsg::LeaveGroup {
+            transfer_ownership, ..
+        } = msg
+        else {
+            panic!("not a leave_group frame");
+        };
+        assert!(!transfer_ownership);
+    }
+
+    /// Every administration frame through the same encode/decode path, one
+    /// broken shape is enough to fail the test.
+    #[test]
+    fn roundtrip_group_administration() {
+        let conv = Uuid::new_v4();
+        let frames = vec![
+            ClientMsg::GroupAddMember {
+                conv_id: conv,
+                target_user_id: 7,
+            },
+            ClientMsg::GroupRemoveMember {
+                conv_id: conv,
+                target_user_id: 7,
+            },
+            ClientMsg::GroupSetAdmin {
+                conv_id: conv,
+                target_user_id: 7,
+                rights: AdminRights {
+                    ban_users: true,
+                    ..AdminRights::default()
+                },
+            },
+            ClientMsg::RenameGroup {
+                conv_id: conv,
+                title: "Новое название".into(),
+            },
+            ClientMsg::LeaveGroup {
+                conv_id: conv,
+                transfer_ownership: true,
+            },
+            ClientMsg::JoinGroup { conv_id: conv },
+            ClientMsg::DeleteGroup { conv_id: conv },
+        ];
+        for msg in frames {
+            let back: ClientMsg = decode(&encode(&msg).unwrap()).unwrap();
+            assert_eq!(back, msg);
+        }
     }
 
     /// A register frame from before invitations existed has no
@@ -572,7 +833,7 @@ mod tests {
                 login: "bob".into(),
             },
         })
-        .unwrap();
+            .unwrap();
         assert!(line.contains(r#""type":"dm_resolved""#), "{line}");
         assert!(line.contains(r#""conv_id""#), "{line}");
         assert!(line.contains(r#""user_id":42"#), "{line}");
@@ -598,7 +859,7 @@ mod tests {
             code: ErrorCode::NotAMember,
             detail: None,
         })
-        .unwrap();
+            .unwrap();
         // Nested tag, the frame tag is "type", the error tag is "code".
         assert!(line.contains(r#""type":"error""#), "{line}");
         assert!(line.contains(r#""code":"not_a_member""#), "{line}");
