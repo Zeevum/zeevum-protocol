@@ -19,6 +19,7 @@
 //! "the other participant".
 
 use serde::{Deserialize, Serialize};
+use tokio::io::AsyncBufReadExt;
 use uuid::Uuid;
 
 pub mod pow;
@@ -306,9 +307,107 @@ pub fn decode<T: serde::de::DeserializeOwned>(line: &str) -> serde_json::Result<
     serde_json::from_str(line.trim())
 }
 
+/// Reads one `\n`-terminated frame, terminator included. Whatever arrived
+/// before the peer closed the stream is returned as the last frame, cut
+/// short; the caller decides what that is worth.
+///
+/// A frame longer than [`MAX_LINE_BYTES`] is
+/// [`std::io::ErrorKind::InvalidData`], which both ends read as "close the
+/// connection": a stranger must not be able to hold it open with an
+/// endless line.
+pub async fn read_frame<S>(reader: &mut S) -> std::io::Result<String>
+where
+    S: AsyncBufReadExt + Unpin,
+{
+    let mut out: Vec<u8> = Vec::with_capacity(512);
+
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return Ok(String::from_utf8_lossy(&out).into_owned());
+        }
+
+        if let Some(pos) = available.iter().position(|&b| b == b'\n') {
+            out.extend_from_slice(&available[..=pos]);
+            reader.consume(pos + 1);
+            return if out.len() > MAX_LINE_BYTES {
+                Err(frame_too_long())
+            } else {
+                Ok(String::from_utf8_lossy(&out).into_owned())
+            };
+        }
+
+        out.extend_from_slice(available);
+        let used = available.len();
+        reader.consume(used);
+
+        if out.len() > MAX_LINE_BYTES {
+            return Err(frame_too_long());
+        }
+    }
+}
+
+fn frame_too_long() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "frame exceeds MAX_LINE_BYTES",
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use tokio::io::BufReader;
+
+    fn reader(bytes: &[u8]) -> BufReader<std::io::Cursor<&[u8]>> {
+        BufReader::new(std::io::Cursor::new(bytes))
+    }
+
+    #[tokio::test]
+    async fn frames_come_out_one_per_call_with_terminators() {
+        let mut r = reader(b"{\"x\":1}\n{\"x\":2}\n");
+        assert_eq!(read_frame(&mut r).await.unwrap(), "{\"x\":1}\n");
+        assert_eq!(read_frame(&mut r).await.unwrap(), "{\"x\":2}\n");
+        assert_eq!(read_frame(&mut r).await.unwrap(), "");
+    }
+
+    /// The peer is free to drop mid-line; what arrived is the frame, the
+    /// caller decides what a frame without its terminator is worth.
+    #[tokio::test]
+    async fn a_frame_cut_short_by_eof_comes_back_as_is() {
+        let mut r = reader(b"{\"x\":1}\n{\"x\":2}");
+        assert_eq!(read_frame(&mut r).await.unwrap(), "{\"x\":1}\n");
+        assert_eq!(read_frame(&mut r).await.unwrap(), "{\"x\":2}");
+    }
+
+    #[tokio::test]
+    async fn a_frame_past_the_limit_is_invalid_data() {
+        let mut oversized = vec![b'a'; MAX_LINE_BYTES];
+        oversized.push(b'\n');
+        let mut r = reader(&oversized);
+        let err = read_frame(&mut r).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn a_frame_exactly_at_the_limit_is_still_a_frame() {
+        let mut at_limit = vec![b'a'; MAX_LINE_BYTES - 1];
+        at_limit.push(b'\n');
+        let mut r = reader(&at_limit);
+        let frame = read_frame(&mut r).await.unwrap();
+        assert_eq!(frame.len(), MAX_LINE_BYTES);
+    }
+
+    /// No newline at all, just an endless stream: the limit has to close
+    /// this, not the terminator.
+    #[tokio::test]
+    async fn an_endless_line_without_a_terminator_is_cut_by_the_limit() {
+        let endless = vec![b'a'; MAX_LINE_BYTES + 1];
+        let mut r = reader(&endless);
+        let err = read_frame(&mut r).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
 
     #[test]
     fn roundtrip_unread_summary() {
